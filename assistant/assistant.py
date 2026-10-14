@@ -109,7 +109,7 @@ def get_rag_assistant(
 
     knowledge = AssistantKnowledge(
         vector_db=vector_db,
-        num_documents=3,
+        num_documents=7,
     )
 
     # 3. LLM Configuration (qwen2.5-coder:1.5b via local Ollama prioritized)

@@ -1,350 +1,338 @@
-"""Streamlit app for AUTOSAR RAG with document retrieval and chat interface."""
+"""Streamlit UI for the AUTOSAR RAG assistant."""
 
-from typing import List
+from __future__ import annotations
+
+import hashlib
+import html
+import json
 import os
 import re
-import debugpy
+from pathlib import Path
+from typing import Optional
+
+import pandas as pd
 import streamlit as st
 from phi.document import Document
 from phi.utils.log import logger
-from PIL import Image
+
 from assistant.assistant import get_rag_assistant
-from posthdl.puml2img import generate_plantuml_image
 from autosar_rag.autosar_loader import AutosarLoader
 from autosar_rag.autosar_splitter import AutosarSplitter
 from autosar_rag.structured_extractor import StructuredExtractor
 from autosar_rag.validator import ConsistencyValidator
-import json
-import pandas as pd
-from phi.embedder.openai import OpenAIEmbedder
+from posthdl.puml2img import generate_plantuml_image
 
-# app.py
-with open('assets/autosar_basic.puml', 'r', encoding='utf-8') as file:
-    autosar_basic_puml = file.read()
+# ---------------------------------------------------------------------------
+# Page setup and paths
+# ---------------------------------------------------------------------------
 
-def extract_plantuml_code(response):
-    """从响应中提取 PlantUML 代码"""
-    pattern = r'@startuml[\s\S]*?@enduml'
-    match = re.search(pattern, response)
-    if match:
-        return match.group(0)
-    return None
+st.set_page_config(
+    page_title="AUTOSAR Assistant | TATA Techpulse",
+    page_icon="🚘",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-def restart_assistant():
-    """Restart assistant."""
+BASE_DIR = Path(__file__).resolve().parent
+ASSETS_DIR = BASE_DIR / "assets"
+PUML_TEMPLATE_PATH = ASSETS_DIR / "autosar_basic.puml"
+LOGO_PATH = ASSETS_DIR / "robot_autosar.jpeg"
+PROCESSED_UPLOADS_KEY = "processed_upload_hashes"
+
+SUGGESTED_QUESTIONS = [
+    "Summarize the responsibilities of the LdCom module.",
+    "Which configuration parameters does the PduR module define?",
+    "/bd Show the layered architecture of the basic software.",
+]
+
+# ---------------------------------------------------------------------------
+# Styling
+#
+# Palette
+#   paper    #EDEFF1  app background (cool grey, like drafting stock)
+#   surface  #F8F9FA  inputs, panels
+#   ink      #1D262D  text
+#   petrol   #0F5C7A  the single accent
+#   amber    #A86A12  warnings      red #B3261E  errors      green #2E7D4F  ok
+# Type: IBM Plex Sans for UI, IBM Plex Mono only for identifiers and code.
+# Shape: 3px radius everywhere, 1px rules for structure, no shadows.
+# ---------------------------------------------------------------------------
+
+CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap');
+
+:root {
+  --paper: #EDEFF1;
+  --side: #E4E8EB;
+  --surface: #F8F9FA;
+  --ink: #1D262D;
+  --muted: #5B6872;
+  --line: #CDD3D8;
+  --line-strong: #A9B3BB;
+  --accent: #0F5C7A;
+  --accent-ink: #FFFFFF;
+  --ok: #2E7D4F;
+  --bad: #B3261E;
+  --radius: 3px;
+}
+
+/* Typography: target text elements only so icon fonts keep working */
+.stApp, .stApp p, .stApp li, .stApp label, .stApp input, .stApp textarea,
+.stApp button, .stApp h1, .stApp h2, .stApp h3, .stApp h4,
+.stApp [data-baseweb="select"], .stApp [data-testid="stMetricValue"],
+.stApp [data-testid="stMetricLabel"] {
+  font-family: 'IBM Plex Sans', system-ui, sans-serif;
+}
+.stApp code, .stApp pre, .stApp pre * {
+  font-family: 'IBM Plex Mono', ui-monospace, monospace;
+}
+.stApp { background: var(--paper); color: var(--ink); }
+.stApp h2, .stApp h3, .stApp h4 { font-weight: 600; letter-spacing: -0.005em; }
+.stApp h3 { font-size: 1.15rem; }
+.stApp h4 { font-size: 1rem; }
+
+/* Chrome */
+footer, .stDeployButton { display: none !important; }
+[data-testid="stHeader"] { background: transparent; }
+.block-container { max-width: 1080px; padding-top: 2rem; padding-bottom: 3rem; }
+
+/* Sidebar */
+[data-testid="stSidebar"] {
+  background: var(--side);
+  border-right: 1px solid var(--line);
+}
+[data-testid="stSidebar"] .block-container { padding-top: 1.5rem; }
+.brand { display: flex; align-items: center; gap: .7rem; margin-bottom: .2rem; }
+.brand-name { font-weight: 600; font-size: 1.02rem; line-height: 1.2; }
+.brand-sub { color: var(--muted); font-size: .8rem; }
+.side-h { font-size: .82rem; font-weight: 600; color: var(--muted); margin: .9rem 0 .35rem; }
+.doc-row {
+  display: flex; justify-content: space-between; gap: .6rem;
+  font-size: .84rem; padding: .35rem 0; border-bottom: 1px solid var(--line);
+}
+.doc-row .n { color: var(--muted); white-space: nowrap; }
+.doc-row .f { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.doc-empty { font-size: .84rem; color: var(--muted); }
+
+/* Page header */
+.app-head h1 {
+  font-family: 'IBM Plex Sans', system-ui, sans-serif;
+  font-size: 1.75rem; font-weight: 600; letter-spacing: -0.015em;
+  margin: 0; padding: 0; color: var(--ink);
+}
+.app-head p { margin: .3rem 0 0; color: var(--muted); font-size: .95rem; max-width: 62ch; }
+
+/* Status strip */
+.status {
+  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
+  border: 1px solid var(--line); background: var(--surface);
+  border-radius: var(--radius); margin: 1.1rem 0 1.5rem;
+}
+.status > div { padding: .6rem .9rem; border-left: 1px solid var(--line); min-width: 0; }
+.status > div:first-child { border-left: 0; }
+.status .k { font-size: .74rem; color: var(--muted); }
+.status .v { font-size: .9rem; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.status .v.mono { font-family: 'IBM Plex Mono', monospace; font-size: .82rem; font-weight: 400; }
+.dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: .45rem; background: var(--bad); }
+.ok .dot { background: var(--ok); }
+@media (max-width: 760px) {
+  .status { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .status > div:nth-child(3) { border-left: 0; }
+  .status > div:nth-child(n+3) { border-top: 1px solid var(--line); }
+}
+
+/* Tabs */
+[data-baseweb="tab-list"] { gap: 1.4rem; border-bottom: 1px solid var(--line); }
+[data-baseweb="tab"] { padding: .5rem 0; height: auto; background: transparent; }
+[data-baseweb="tab"] p { font-weight: 500; color: var(--muted); }
+[data-baseweb="tab"][aria-selected="true"] p { color: var(--ink); }
+[data-baseweb="tab-highlight"] { background: var(--accent); height: 2px; }
+[data-baseweb="tab-border"] { display: none; }
+
+/* Buttons */
+.stButton > button, .stDownloadButton > button {
+  border-radius: var(--radius); box-shadow: none; font-weight: 500;
+  border: 1px solid var(--line-strong); background: var(--surface); color: var(--ink);
+  transition: border-color .12s, color .12s, background .12s;
+}
+.stButton > button:hover, .stDownloadButton > button:hover {
+  border-color: var(--accent); color: var(--accent); background: var(--surface);
+}
+.stButton > button[kind="primary"], [data-testid="stBaseButton-primary"] {
+  background: var(--accent); border-color: var(--accent); color: var(--accent-ink);
+}
+.stButton > button[kind="primary"]:hover, [data-testid="stBaseButton-primary"]:hover {
+  background: #0B4A63; border-color: #0B4A63; color: var(--accent-ink);
+}
+.stButton > button:focus-visible, .stDownloadButton > button:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px;
+}
+.suggest .stButton > button { text-align: left; justify-content: flex-start; height: 100%; font-weight: 400; }
+
+/* Inputs */
+[data-baseweb="select"] > div, [data-baseweb="input"] > div, [data-baseweb="textarea"],
+.stTextArea textarea, .stTextInput input {
+  border-radius: var(--radius) !important;
+  background: var(--surface) !important;
+  border-color: var(--line-strong) !important;
+}
+[data-testid="stFileUploader"] section {
+  border-radius: var(--radius); background: var(--surface); border: 1px dashed var(--line-strong);
+}
+[data-testid="stExpander"] {
+  border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface);
+}
+[data-testid="stAlert"] { border-radius: var(--radius); }
+[data-testid="stMetric"] {
+  border: 1px solid var(--line); border-radius: var(--radius);
+  background: var(--surface); padding: .7rem .9rem;
+}
+[data-testid="stMetricLabel"] { color: var(--muted); }
+[data-testid="stDataFrame"] { border: 1px solid var(--line); border-radius: var(--radius); }
+
+/* Chat: ruled messages instead of bubbles */
+[data-testid="stChatMessageAvatarUser"], [data-testid="stChatMessageAvatarAssistant"] { display: none; }
+[data-testid="stChatMessage"] {
+  background: transparent; border-radius: 0; box-shadow: none;
+  border-left: 2px solid var(--accent); padding: .35rem 0 .35rem 1rem; margin-bottom: .8rem;
+}
+[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) {
+  background: var(--surface); border: 1px solid var(--line); border-left: 2px solid var(--ink);
+  padding: .6rem 1rem; border-radius: 0 var(--radius) var(--radius) 0;
+}
+[data-testid="stChatMessage"] pre { border: 1px solid var(--line); border-radius: var(--radius); }
+[data-testid="stChatInput"] {
+  border: 1px solid var(--line-strong); border-radius: var(--radius); background: var(--surface);
+}
+[data-testid="stChatInput"]:focus-within { border-color: var(--accent); }
+.hint { font-size: .84rem; color: var(--muted); margin: .2rem 0 .8rem; }
+</style>
+"""
+
+
+def inject_css() -> None:
+    st.markdown(CSS, unsafe_allow_html=True)
+
+
+def read_puml_template() -> str:
+    """Load the optional PlantUML template without crashing the app."""
+    try:
+        return PUML_TEMPLATE_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+AUTOSAR_BASIC_PUML = read_puml_template()
+
+
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
+
+def init_state() -> None:
+    defaults = {
+        "rag_assistant": None,
+        "rag_assistant_run_id": None,
+        "messages": [
+            {
+                "role": "assistant",
+                "content": (
+                    "Upload an AUTOSAR PDF from the sidebar, then ask a question. "
+                    "Answers come from the indexed documentation."
+                ),
+            }
+        ],
+        "processed_upload_hashes": set(),
+        "indexed_files": [],
+        "pending_prompt": None,
+        "custom_prompt": "",
+        "llm_model": None,
+        "embeddings_model": None,
+        "last_error": None,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def extract_plantuml_code(response: str) -> Optional[str]:
+    match = re.search(r"@startuml\b[\s\S]*?@enduml", response or "", re.IGNORECASE)
+    return match.group(0) if match else None
+
+
+def reset_assistant() -> None:
     st.session_state["rag_assistant"] = None
     st.session_state["rag_assistant_run_id"] = None
-    if "url_scrape_key" in st.session_state:
-        st.session_state["url_scrape_key"] += 1
-    if "file_uploader_key" in st.session_state:
-        st.session_state["file_uploader_key"] += 1
+    st.session_state["messages"] = [
+        {
+            "role": "assistant",
+            "content": "New conversation started. Indexed documents are kept.",
+        }
+    ]
     st.rerun()
 
-def configure_embedding_backend(embeddings_model):
-    """Create an OpenAI embedder when the selected embedding model is OpenAI-based."""
-    if embeddings_model.startswith("text-embedding-") or "openai" in embeddings_model.lower():
-        st.session_state["openai_embedder"] = OpenAIEmbedder(model=embeddings_model)
-    else:
-        st.session_state.pop("openai_embedder", None)
 
-
-def update_llm_config(llm_model, embeddings_model):
-    """Check llm config."""
-    # Set assistant_type in session state
-    if "llm_model" not in st.session_state:
-        st.session_state["llm_model"] = llm_model
-    # Restart the assistant if assistant_type has changed
-    elif st.session_state["llm_model"] != llm_model:
-        st.session_state["llm_model"] = llm_model
-        restart_assistant()
-
-    if "embeddings_model" not in st.session_state:
-        st.session_state["embeddings_model"] = embeddings_model
-    # Restart the assistant if assistant_type has changed
-    elif st.session_state["embeddings_model"] != embeddings_model:
-        st.session_state["embeddings_model"] = embeddings_model
-        st.session_state["embeddings_model_updated"] = True
-        restart_assistant()
-
-    configure_embedding_backend(embeddings_model)
-
-def get_or_create_assistant(llm_model, embeddings_model, custom_prompt, openrouter_api_key=None):
-    """Get or create assistant."""
-    if ("rag_assistant" not in st.session_state or
-        st.session_state["rag_assistant"] is None or
-        st.session_state.get("custom_prompt") != custom_prompt):
-
-        logger.info("---*--- Creating %s Assistant ---*---", llm_model)
-        rag_assistant = get_rag_assistant(
-            llm_model=llm_model,
-            embeddings_model=embeddings_model,
-            instructions=custom_prompt,
-            openrouter_api_key=openrouter_api_key
-        )
-        st.session_state["rag_assistant"] = rag_assistant
-        st.session_state["custom_prompt"] = custom_prompt  # Store the custom prompt in session state
-    else:
-        rag_assistant = st.session_state["rag_assistant"]
-
-    try:
-        st.session_state["rag_assistant_run_id"] = rag_assistant.create_run()
-    except (ConnectionError, TimeoutError) as e:
-        st.warning(f"Could not create assistant: {str(e)}. Is the database running?")
-        return None
-
-    return rag_assistant
-
-def load_assistant_chat_history(rag_assistant):
-    """Load chat history from the assistant's memory."""
-    if not rag_assistant:
-        st.session_state["messages"] = [{
-            "role": "assistant", 
-            "content": "Please verify local Ollama and database status to start chatting."
-        }]
-        return
-
-    assistant_chat_history = rag_assistant.memory.get_chat_history()
-    if len(assistant_chat_history) > 0:
-        logger.debug("Loading chat history")
-        st.session_state["messages"] = assistant_chat_history
-    else:
-        logger.debug("No chat history found")
-        st.session_state["messages"] = [{
-            "role": "assistant", 
-            "content": "Upload a doc or ask me questions about AUTOSAR directly..."
-        }]
-
-def load_knowledge_base(rag_assistant):
-    """Load knowledge base."""
-    if not rag_assistant or not rag_assistant.knowledge_base:
-        return
-
-    # Add PDFs to knowledge base
-    if "file_uploader_key" not in st.session_state:
-        st.session_state["file_uploader_key"] = 100
-
-    uploaded_file = st.sidebar.file_uploader(
-        "Add a PDF :page_facing_up:", type="pdf", key=st.session_state["file_uploader_key"]
+def assistant_config_changed(llm_model: str, embeddings_model: str, custom_prompt: str) -> bool:
+    return (
+        st.session_state.get("llm_model") != llm_model
+        or st.session_state.get("embeddings_model") != embeddings_model
+        or st.session_state.get("custom_prompt") != custom_prompt
     )
-    if uploaded_file is not None:
-        process_uploaded_file(rag_assistant, uploaded_file)
 
-    if rag_assistant.knowledge_base.vector_db:
-        if st.sidebar.button("Clear Knowledge Base", help="Clear all documents from the knowledge base."):
-            rag_assistant.knowledge_base.vector_db.drop()
-            st.sidebar.success("Knowledge base cleared")
 
-def process_uploaded_file(rag_assistant, uploaded_file):
-    """Process the uploaded PDF file."""
-    alert = st.sidebar.info("Processing PDF...", icon="🧠")
-    rag_name = uploaded_file.name.split(".")[0]
-    if f"{rag_name}_uploaded" not in st.session_state:
-        # chunk_size and separators can be set here
-        logger.debug(uploaded_file)
-        loader = AutosarLoader(uploaded_file)
-        splitter = AutosarSplitter(chunk_size=300, chunk_overlap=20)
-        raw_documents: List[Document] = loader.load()
-        rag_documents: List[Document] = splitter.split_documents(raw_documents)
-        phi_rag_documents: List[Document] = []
-        # there are some difference in docment defination between langchain Document and phidata Document
-        # so, convert them here for next operation
-        for doc in rag_documents:
-            phi_rag_documents.append(Document(content=doc.page_content,name=doc.metadata["source"], meta_data=doc.metadata))
-        if rag_documents:
-            print("Documents to index:", len(phi_rag_documents))
-
-            for i, doc in enumerate(phi_rag_documents[:5]):
-                content = getattr(doc, "content", None)
-                embedding = getattr(doc, "embedding", None)
-
-                print(
-                    f"Document {i}:",
-                    "content_length =", len(content or ""),
-                    "embedding_length =",
-                    len(embedding) if embedding is not None else None,
-                )
-
-                if not content or not content.strip():
-                    print("WARNING: Empty document content")    
-            rag_assistant.knowledge_base.load_documents(phi_rag_documents, upsert=True)
-        else:
-            st.sidebar.error("Could not read PDF")
-        st.session_state[f"{rag_name}_uploaded"] = True
-    alert.empty()
-
-def initialize_debugger(enable_debug: bool = False):
-    """Initialize debugpy for remote debugging if enabled."""
-    if enable_debug and "debugpy_initialized" not in st.session_state:
-        st.session_state.debugpy_initialized = True
-        debugpy.listen(("localhost", 5678))
-        print("Waiting for debugger attach...")
-        debugpy.wait_for_client()
-
-def set_page_config():
-    """Set page config."""
-    st.image("assets/robot_autosar.jpeg", width=700)  # Adjust the width as needed
-    st.markdown("## :oncoming_automobile: TATA Techpulse AUTOSAR Assistant")
-    st.markdown("Welcome to the TATA Techpulse AUTOSAR Assistant. Fast local inference powered by **Qwen2.5-Coder:1.5B** via Ollama.")
-    st.markdown("---")
-
-def update_session_content(session_messages, rag_assistant):
-    """Update session content."""
-    # Prompt for user input using a chat input box from Streamlit
-    if prompt := st.chat_input():
-        session_messages.append({"role": "user", "content": prompt})
-
-    # Display existing chat messages
-    for message in session_messages:
-        if message["role"] == "system":
-            continue
-        with st.chat_message(message["role"]):
-            st.write(message["content"])
-
-    # If last message is from a user, generate a new response
-    last_message = session_messages[-1]
-    if last_message.get("role") == "user":
-        if not rag_assistant:
-            with st.chat_message("assistant"):
-                st.error("Assistant is not initialized. Please ensure Ollama and database services are running.")
-            return
-
-        question = last_message["content"]
-        if "/bd" in question:
-            question = question.replace("/bd", "").strip()
-            question += " \n Generate corresponding plantUML code(marked with startuml and enduml) of block diagram based on the following plantUML code of high level AUTOSAR architecture block digram: \n"
-            question += autosar_basic_puml
-            with st.chat_message("assistant"):
-                response = ""
-                resp_container = st.empty()
-                for delta in rag_assistant.run(question):
-                    response += delta  # type: ignore
-                    resp_container.markdown(response)
-                session_messages.append({"role": "assistant", "content": response})
-
-                # Check if the response contains PlantUML code and export it
-                plantuml_code = extract_plantuml_code(response)
-                if plantuml_code:
-                    with open("generated_diagram.puml", "w", encoding="utf-8") as puml_file:
-                        puml_file.write(plantuml_code)
-
-                # Add the generated plantUML image and display it in a new popup window
-                image_path = "output.png"
-                generate_plantuml_image("generated_diagram.puml", image_path)
-                if os.path.exists(image_path):
-                    image = Image.open(image_path)
-                    st.session_state["messages"].append({"role": "assistant", "content_type": "image", "content": image})
-                    st.image(image, caption="Generated AUTOSAR PlantUML Diagram")
-
-        else:
-            with st.chat_message("assistant"):
-                response = ""
-                resp_container = st.empty()
-                for delta in rag_assistant.run(question):
-                    response += delta  # type: ignore
-                    resp_container.markdown(response)
-                session_messages.append({"role": "assistant", "content": response})
-
-def load_assistant_storage(rag_assistant, llm_model, embeddings_model):
-    """Load assistant storage."""
-    if not rag_assistant or not rag_assistant.storage:
-        return
-    rag_assistant_run_ids: List[str] = rag_assistant.storage.get_all_run_ids()
-    if not rag_assistant_run_ids:
-        return
-    new_rag_assistant_run_id = st.sidebar.selectbox("Run ID", options=rag_assistant_run_ids)
-    if st.session_state["rag_assistant_run_id"] != new_rag_assistant_run_id:
-        logger.info("---*--- Loading %s run: %s ---*---", llm_model, new_rag_assistant_run_id)
-        st.session_state["rag_assistant"] = get_rag_assistant(
-            llm_model=llm_model, embeddings_model=embeddings_model, run_id=new_rag_assistant_run_id
-        )
-        st.rerun()
-
-def run_structured_analysis(rag_assistant, llm_model="qwen2.5-coder:1.5b", openrouter_api_key=None):
-    """Run structured extraction, validation, and export workflow."""
-    extractor = StructuredExtractor(llm_model=llm_model, openrouter_api_key=openrouter_api_key)
-    validator = ConsistencyValidator()
-
-    all_documents = []
-    if rag_assistant and rag_assistant.knowledge_base:
-        # Search for relevant chunks to extract from
-        all_documents = rag_assistant.knowledge_base.search(
-            "AUTOSAR component architecture ports interfaces"
-        )
-        all_documents = all_documents[:10]
-    if not all_documents:
-        st.warning("No documents loaded. Please upload a PDF first.")
-        return
-
-    extractions = []
-    for doc in all_documents:
-        extractions.append(extractor.extract_from_text(doc.content))
-
-    structured_model = extractor.merge_extractions(extractions)
-
-    if structured_model["components"]:
-        st.markdown("### Extracted Component Inventory")
-        df = pd.DataFrame([{"Component": c["name"], "Type": c.get("type", "N/A"), "Ports Count": len(c.get("ports", []))} for c in structured_model["components"]])
-        st.dataframe(df)
-
-        # Export
-        col1, col2 = st.columns(2)
-        with col1:
-            st.download_button("Download Components JSON", json.dumps(structured_model, indent=4), file_name="architecture.json")
-        with col2:
-            st.download_button("Download Components CSV", df.to_csv(index=False), file_name="components_inventory.csv")
-
-    # Consistency Check
-    findings = validator.validate_model(structured_model)
-    st.markdown("### Consistency Report")
-    if findings:
-        for f in findings:
-            if f["severity"] == "Error":
-                st.error(f"[{f['component']}] {f['issue']}")
-            else:
-                st.warning(f"[{f['component']}] {f['issue']}")
-    else:
-        st.success("No inconsistencies detected in the current model.")
-
-def run_revision_comparison():
-    """Compare two structured models from uploaded revisions."""
-    st.markdown("### Document Revision Comparison")
-    col1, col2 = st.columns(2)
-    with col1:
-        old_file = st.file_uploader("Upload Old Revision JSON", type="json")
-    with col2:
-        new_file = st.file_uploader("Upload New Revision JSON", type="json")
-
-    if old_file and new_file:
+def get_or_create_assistant(
+    llm_model: str,
+    embeddings_model: str,
+    custom_prompt: str,
+    openrouter_api_key: Optional[str],
+):
+    config_changed = assistant_config_changed(llm_model, embeddings_model, custom_prompt)
+    if st.session_state["rag_assistant"] is None or config_changed:
         try:
-            old_model = json.load(old_file)
-            new_model = json.load(new_file)
-            validator = ConsistencyValidator()
-            diff = validator.compare_revisions(old_model, new_model)
+            with st.spinner("Connecting to the model and vector store..."):
+                assistant = get_rag_assistant(
+                    llm_model=llm_model,
+                    embeddings_model=embeddings_model,
+                    instructions=custom_prompt or None,
+                    openrouter_api_key=openrouter_api_key,
+                )
+                run_id = assistant.create_run()
 
-            if diff["added_components"]:
-                st.markdown("**Newly Added Components:**")
-                st.success(", ".join(diff["added_components"]))
-            if diff["removed_components"]:
-                st.markdown("**Removed Components:**")
-                st.error(", ".join(diff["removed_components"]))
-            if diff["modified_components"]:
-                st.markdown("**Modified Components:**")
-                st.warning(", ".join(diff["modified_components"]))
-        except Exception as e:
-            st.error(f"Error comparing revisions: {e}")
+            st.session_state["rag_assistant"] = assistant
+            st.session_state["rag_assistant_run_id"] = run_id
+            st.session_state["llm_model"] = llm_model
+            st.session_state["embeddings_model"] = embeddings_model
+            st.session_state["custom_prompt"] = custom_prompt
+            st.session_state["last_error"] = None
+        except Exception as exc:
+            st.session_state["last_error"] = str(exc)
+            logger.exception("Assistant initialization failed")
+            return None
+    return st.session_state["rag_assistant"]
 
-def main(enable_debug: bool = False) -> None:
-    """Main function for the Streamlit app."""
-    # Set page config
-    set_page_config()
 
-    # Start debugger on localhost:5678, and ensure listen only once
-    initialize_debugger(enable_debug)
+# ---------------------------------------------------------------------------
+# Sidebar
+# ---------------------------------------------------------------------------
 
-    # Side bar configuration for llm and embeddings
-    llm_model = st.sidebar.selectbox(
-        "Select Model",
-        options=[
+def side_heading(text: str) -> None:
+    st.markdown(f"<div class='side-h'>{html.escape(text)}</div>", unsafe_allow_html=True)
+
+
+def render_sidebar():
+    with st.sidebar:
+        logo_col, name_col = st.columns([1, 3], vertical_alignment="center")
+        if LOGO_PATH.exists():
+            logo_col.image(str(LOGO_PATH), width=48)
+        name_col.markdown(
+            "<div class='brand-name'>AUTOSAR Assistant</div>"
+            "<div class='brand-sub'>TATA Techpulse</div>",
+            unsafe_allow_html=True,
+        )
+
+        side_heading("Models")
+        llm_options = [
             "qwen2.5-coder:1.5b",
             "llama3.2:1b",
             "llama3.1",
@@ -357,74 +345,572 @@ def main(enable_debug: bool = False) -> None:
             "openrouter/mistralai/mixtral-8x7b-instruct",
             "openhermes",
             "llama2",
-            "gpt-3.5-turbo"
+            "gpt-3.5-turbo",
         ]
-    )
-
-    openrouter_api_key = None
-    if llm_model.startswith("openrouter/"):
-        openrouter_api_key = st.sidebar.text_input(
-            "OpenRouter API Key",
-            type="password"
+        llm_model = st.selectbox(
+            "Language model",
+            options=llm_options,
+            index=0,
+            help="The model that writes the answer.",
         )
-        if not openrouter_api_key:
-            st.sidebar.warning("Please provide an OpenRouter API Key to proceed.")
 
-    embeddings_model = st.sidebar.selectbox(
-        "Select Embeddings",
-        options=[
+        openrouter_api_key = None
+        if llm_model.startswith("openrouter/"):
+            openrouter_api_key = st.text_input(
+                "OpenRouter API key",
+                type="password",
+                value=os.getenv("OPENROUTER_API_KEY", ""),
+                help="Prefer setting OPENROUTER_API_KEY in your environment.",
+            )
+            if not openrouter_api_key:
+                st.warning("Enter an OpenRouter API key to use this model.")
+
+        embedding_options = [
             "all-minilm:l6-v2",
             "nomic-embed-text",
             "liquid/lfm-2.5-embedding-350m:free",
-            "llama3",
-            "openhermes",
-            "phi3"
-        ],
-        help="When you change the embeddings model, documents will need to be reloaded into the matching collection.",
-    )
-
-    update_llm_config(llm_model, embeddings_model)
-
-    # Add a text input in the sidebar for custom prompt
-    custom_prompt = st.sidebar.text_area(
-        "Enter system instruction:",
-        placeholder=(
-            "I want you to be a good assistant...\n"
-            "You need to think like a human...\n"
+        ]
+        embeddings_model = st.selectbox(
+            "Embedding model",
+            options=embedding_options,
+            index=0,
+            help=(
+                "Changing the embedding model may need a separate Qdrant collection "
+                "or a full re-index, because vector dimensions must match."
+            ),
         )
+
+        custom_prompt = st.text_area(
+            "Additional instructions",
+            value=st.session_state.get("custom_prompt", ""),
+            placeholder="Project-specific rules, naming conventions, scope...",
+            height=96,
+        )
+
+        if st.button("Apply changes", use_container_width=True):
+            st.session_state["rag_assistant"] = None
+            st.session_state["llm_model"] = None
+            st.session_state["embeddings_model"] = None
+            st.session_state["custom_prompt"] = custom_prompt
+            st.rerun()
+
+        side_heading("Documents")
+        uploaded_file = st.file_uploader(
+            "Add AUTOSAR PDF",
+            type=["pdf"],
+            label_visibility="collapsed",
+            help="Upload a specification or engineering document to index.",
+        )
+
+        upload_request = None
+        if uploaded_file is not None:
+            if st.button("Index PDF", type="primary", use_container_width=True):
+                upload_request = uploaded_file
+
+        indexed = st.session_state["indexed_files"]
+        if indexed:
+            rows = "".join(
+                f"<div class='doc-row'><span class='f'>{html.escape(name)}</span>"
+                f"<span class='n'>{count} chunks</span></div>"
+                for name, count in indexed
+            )
+            st.markdown(rows, unsafe_allow_html=True)
+        else:
+            st.markdown(
+                "<div class='doc-empty'>Nothing indexed in this session yet.</div>",
+                unsafe_allow_html=True,
+            )
+
+        side_heading("Session")
+        if st.button("New conversation", use_container_width=True):
+            reset_assistant()
+        if st.button("Clear indexed knowledge", use_container_width=True):
+            st.session_state["confirm_clear_knowledge"] = True
+        if st.session_state.get("confirm_clear_knowledge"):
+            st.warning("This deletes all indexed data in the configured Qdrant collection.")
+            confirm_col, cancel_col = st.columns(2)
+            if confirm_col.button("Delete data", type="primary"):
+                assistant = st.session_state.get("rag_assistant")
+                try:
+                    if assistant and assistant.knowledge_base and assistant.knowledge_base.vector_db:
+                        assistant.knowledge_base.vector_db.drop()
+                        st.success("Knowledge collection cleared.")
+                        st.session_state[PROCESSED_UPLOADS_KEY] = set()
+                        st.session_state["indexed_files"] = []
+                    else:
+                        st.info("Assistant or vector database is not initialized.")
+                except Exception as exc:
+                    st.error(f"Could not clear the collection: {exc}")
+                st.session_state["confirm_clear_knowledge"] = False
+            if cancel_col.button("Cancel"):
+                st.session_state["confirm_clear_knowledge"] = False
+                st.rerun()
+
+    return llm_model, embeddings_model, custom_prompt, openrouter_api_key, upload_request
+
+
+# ---------------------------------------------------------------------------
+# Header
+# ---------------------------------------------------------------------------
+
+def render_header(connected: bool) -> None:
+    st.markdown(
+        "<div class='app-head'><h1>AUTOSAR Assistant</h1>"
+        "<p>Search specifications, extract component architecture, "
+        "compare revisions and measure retrieval quality.</p></div>",
+        unsafe_allow_html=True,
     )
 
-    # create instance of assistant
-    rag_assistant = get_or_create_assistant(llm_model, embeddings_model, custom_prompt, openrouter_api_key)
+    llm = st.session_state.get("llm_model") or "not set"
+    emb = st.session_state.get("embeddings_model") or "not set"
+    chunk_total = sum(count for _, count in st.session_state["indexed_files"])
+    doc_total = len(st.session_state["indexed_files"])
+    state_class = "ok" if connected else ""
+    state_text = "Connected" if connected else "Not connected"
 
-    load_assistant_chat_history(rag_assistant)
+    st.markdown(
+        f"""
+        <div class="status">
+          <div><div class="k">Language model</div><div class="v mono">{html.escape(llm)}</div></div>
+          <div><div class="k">Embeddings</div><div class="v mono">{html.escape(emb)}</div></div>
+          <div><div class="k">Indexed this session</div>
+               <div class="v">{doc_total} document{'s' if doc_total != 1 else ''}, {chunk_total} chunks</div></div>
+          <div class="{state_class}"><div class="k">Backend</div>
+               <div class="v"><span class="dot"></span>{state_text}</div></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    # update session content with user input and assistant response
-    session_messages = st.session_state["messages"]
-    update_session_content(session_messages, rag_assistant)
 
-    load_knowledge_base(rag_assistant)
+# ---------------------------------------------------------------------------
+# Indexing
+# ---------------------------------------------------------------------------
 
-    # Tabs for structured analysis features
-    tab1, tab2, tab3 = st.tabs(["Chat Interface", "Structured Architecture", "Revision Comparison"])
+def index_uploaded_pdf(assistant, uploaded_file) -> None:
+    if assistant is None:
+        st.error("Assistant is not initialized. Check the model, API key and database connection.")
+        return
 
-    if st.sidebar.button("Run Structured Analysis", help="Extracts components and checks consistency"):
-        run_structured_analysis(rag_assistant, llm_model=llm_model, openrouter_api_key=openrouter_api_key)
+    file_bytes = uploaded_file.getvalue()
+    file_hash = hashlib.sha256(file_bytes).hexdigest()
+    if file_hash in st.session_state[PROCESSED_UPLOADS_KEY]:
+        st.info("This exact PDF was already indexed in this session.")
+        return
 
-    with tab2:
-        if st.button("Execute Extraction"):
-            run_structured_analysis(rag_assistant, llm_model=llm_model, openrouter_api_key=openrouter_api_key)
+    try:
+        with st.status(f"Indexing {uploaded_file.name}", expanded=True) as status:
+            st.write("Reading PDF pages...")
+            loader = AutosarLoader(uploaded_file)
+            raw_documents = loader.load()
+            if not raw_documents:
+                status.update(label="PDF could not be read", state="error")
+                st.error("No readable text was extracted. A scanned PDF needs OCR first.")
+                return
 
-    with tab3:
-        run_revision_comparison()
+            st.write(f"Extracted {len(raw_documents)} source sections.")
+            st.write("Splitting text into retrieval chunks...")
+            splitter = AutosarSplitter(chunk_size=200, chunk_overlap=30)
+            chunks = splitter.split_documents(raw_documents)
+            chunks = [
+                chunk for chunk in chunks
+                if getattr(chunk, "page_content", "").strip()
+            ]
+            if not chunks:
+                status.update(label="No usable text chunks found", state="error")
+                st.error("The PDF produced no non-empty text chunks.")
+                return
 
-    load_assistant_storage(rag_assistant, llm_model, embeddings_model)
+            phi_documents = []
+            for chunk in chunks:
+                metadata = dict(getattr(chunk, "metadata", {}) or {})
+                source = metadata.get("source", uploaded_file.name)
+                phi_documents.append(
+                    Document(
+                        content=chunk.page_content,
+                        name=str(source),
+                        meta_data=metadata,
+                    )
+                )
 
-    if st.sidebar.button(
-        "New Run",
-        help="Reset the session and reload the assistant."
-    ):
-        restart_assistant()
+            st.write(f"Writing {len(phi_documents)} chunks to the vector database...")
+            assistant.knowledge_base.load_documents(phi_documents, upsert=True)
+            st.session_state[PROCESSED_UPLOADS_KEY].add(file_hash)
+            st.session_state["indexed_files"].append((uploaded_file.name, len(phi_documents)))
+            status.update(label=f"Indexed {uploaded_file.name}", state="complete")
+        st.rerun()
+    except Exception as exc:
+        logger.exception("PDF indexing failed")
+        st.error(f"Indexing failed: {exc}")
+        st.caption(
+            "For rate-limit errors, wait for the provider quota to reset. "
+            "For vector dimension errors, use a collection that matches the selected embedder."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Chat
+# ---------------------------------------------------------------------------
+
+def build_query(prompt: str) -> tuple[str, bool]:
+    is_diagram_request = "/bd" in prompt
+    if not is_diagram_request:
+        return prompt, False
+
+    query = prompt.replace("/bd", "").strip()
+    if AUTOSAR_BASIC_PUML:
+        query += (
+            "\nGenerate a PlantUML block diagram. Return the code between "
+            "@startuml and @enduml, using this architecture as a reference:\n"
+            + AUTOSAR_BASIC_PUML
+        )
+    else:
+        query += "\nGenerate a PlantUML block diagram between @startuml and @enduml."
+    return query, True
+
+
+def queue_prompt(text: str) -> None:
+    st.session_state["pending_prompt"] = text
+
+
+def render_chat(assistant) -> None:
+    pending = st.session_state.pop("pending_prompt", None)
+
+    for message in st.session_state["messages"]:
+        if message.get("role") not in {"assistant", "user"}:
+            continue
+        with st.chat_message(message["role"]):
+            st.markdown(message.get("content", ""))
+
+    if len(st.session_state["messages"]) == 1 and not pending:
+        st.markdown(
+            "<div class='hint'>Try one of these, or type your own. "
+            "Add <code>/bd</code> to a question to get a block diagram.</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown("<div class='suggest'>", unsafe_allow_html=True)
+        cols = st.columns(len(SUGGESTED_QUESTIONS))
+        for idx, (col, text) in enumerate(zip(cols, SUGGESTED_QUESTIONS)):
+            col.button(text, key=f"suggest_{idx}", on_click=queue_prompt, args=(text,), use_container_width=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    typed = st.chat_input("Ask about your AUTOSAR documents")
+    prompt = typed or pending
+    if not prompt:
+        return
+
+    st.session_state["messages"].append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    if assistant is None:
+        with st.chat_message("assistant"):
+            st.error("The assistant is unavailable. Fix the configuration or database connection first.")
+        return
+
+    query, is_diagram_request = build_query(prompt)
+
+    with st.chat_message("assistant"):
+        response_area = st.empty()
+        full_response = ""
+        try:
+            with st.spinner("Searching indexed documents..."):
+                result = assistant.run(query)
+                if isinstance(result, str):
+                    full_response = result
+                elif hasattr(result, "content") and isinstance(result.content, str):
+                    full_response = result.content
+                else:
+                    for delta in result:
+                        if isinstance(delta, str):
+                            full_response += delta
+                        elif getattr(delta, "content", None):
+                            full_response += str(delta.content)
+                        response_area.markdown(full_response)
+            response_area.markdown(full_response or "_No response returned._")
+            st.session_state["messages"].append(
+                {"role": "assistant", "content": full_response or "No response returned."}
+            )
+
+            if is_diagram_request:
+                render_diagram(full_response)
+        except Exception as exc:
+            logger.exception("Chat response failed")
+            response_area.error(f"Could not generate a response: {exc}")
+
+
+def render_diagram(full_response: str) -> None:
+    puml_code = extract_plantuml_code(full_response)
+    if not puml_code:
+        st.info("No PlantUML block was found in the response. Ask for code between @startuml and @enduml.")
+        return
+
+    puml_path = BASE_DIR / "generated_diagram.puml"
+    image_path = BASE_DIR / "output.png"
+    puml_path.write_text(puml_code, encoding="utf-8")
+    try:
+        generate_plantuml_image(str(puml_path), str(image_path))
+        if image_path.exists():
+            st.image(str(image_path), caption="Generated block diagram", use_container_width=True)
+            st.download_button(
+                "Download PlantUML source",
+                data=puml_code,
+                file_name="generated_diagram.puml",
+                mime="text/plain",
+            )
+    except Exception as exc:
+        st.warning(f"Diagram rendering failed. The PlantUML source is shown below. ({exc})")
+        st.code(puml_code, language="text")
+
+
+# ---------------------------------------------------------------------------
+# Architecture analysis
+# ---------------------------------------------------------------------------
+
+def render_structured_analysis(assistant, llm_model: str, api_key: Optional[str]) -> None:
+    st.markdown("#### Architecture extraction")
+    st.write(
+        "Pulls architecture-related chunks from the index, extracts a component "
+        "inventory with an LLM, then runs consistency checks on the result."
+    )
+    if not st.button("Run extraction", type="primary"):
+        return
+
+    if assistant is None or not assistant.knowledge_base:
+        st.warning("Initialize the assistant and index a PDF first.")
+        return
+    try:
+        with st.spinner("Retrieving evidence and extracting components..."):
+            docs = assistant.knowledge_base.search(
+                "AUTOSAR component architecture ports interfaces dependencies"
+            )
+            docs = docs[:10] if docs else []
+            if not docs:
+                st.warning("No matching chunks found. Index an architecture document first.")
+                return
+
+            extractor = StructuredExtractor(
+                llm_model=llm_model,
+                openrouter_api_key=api_key,
+            )
+            extractions = [
+                extractor.extract_from_text(doc.content)
+                for doc in docs
+                if getattr(doc, "content", "").strip()
+            ]
+            model = extractor.merge_extractions(extractions)
+            findings = ConsistencyValidator().validate_model(model)
+
+        components = model.get("components", [])
+        total_ports = sum(len(item.get("ports", [])) for item in components)
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Components", len(components))
+        m2.metric("Ports", total_ports)
+        m3.metric("Findings", len(findings or []))
+
+        if components:
+            df = pd.DataFrame(
+                [
+                    {
+                        "Component": item.get("name", "Unknown"),
+                        "Type": item.get("type", "N/A"),
+                        "Ports": len(item.get("ports", [])),
+                    }
+                    for item in components
+                ]
+            )
+            st.markdown("#### Component inventory")
+            st.dataframe(df, use_container_width=True, hide_index=True)
+            left, right = st.columns(2)
+            left.download_button(
+                "Download JSON",
+                data=json.dumps(model, indent=2, ensure_ascii=False),
+                file_name="architecture_inventory.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+            right.download_button(
+                "Download CSV",
+                data=df.to_csv(index=False),
+                file_name="components_inventory.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+        else:
+            st.info("No components were extracted from the retrieved evidence.")
+
+        st.markdown("#### Consistency report")
+        if findings:
+            for finding in findings:
+                severity = str(finding.get("severity", "Warning")).lower()
+                message = (
+                    f"**{finding.get('component', 'Unknown component')}**: "
+                    f"{finding.get('issue', 'Unspecified finding')}"
+                )
+                if severity == "error":
+                    st.error(message)
+                else:
+                    st.warning(message)
+        else:
+            st.success("The validator found no inconsistencies.")
+    except Exception as exc:
+        logger.exception("Structured analysis failed")
+        st.error(f"Structured analysis failed: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Revision comparison
+# ---------------------------------------------------------------------------
+
+def render_revision_comparison() -> None:
+    st.markdown("#### Compare architecture revisions")
+    st.write(
+        "Upload two JSON inventories exported from the Architecture tab. "
+        "This compares extracted models, not the raw PDFs."
+    )
+    col_old, col_new = st.columns(2)
+    with col_old:
+        old_file = st.file_uploader("Older revision (JSON)", type=["json"], key="old_revision_json")
+    with col_new:
+        new_file = st.file_uploader("Newer revision (JSON)", type=["json"], key="new_revision_json")
+
+    if not (old_file and new_file):
+        return
+    if not st.button("Compare revisions", type="primary"):
+        return
+
+    try:
+        old_model = json.load(old_file)
+        new_model = json.load(new_file)
+        diff = ConsistencyValidator().compare_revisions(old_model, new_model)
+        added = diff.get("added_components", [])
+        removed = diff.get("removed_components", [])
+        modified = diff.get("modified_components", [])
+
+        a, r, m = st.columns(3)
+        a.metric("Added", len(added))
+        r.metric("Removed", len(removed))
+        m.metric("Modified", len(modified))
+
+        if added:
+            st.success("Added: " + ", ".join(added))
+        if removed:
+            st.error("Removed: " + ", ".join(removed))
+        if modified:
+            st.warning("Modified: " + ", ".join(modified))
+        if not any((added, removed, modified)):
+            st.info("No component-level changes were detected.")
+    except Exception as exc:
+        st.error(f"Could not compare revisions: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+
+def render_dataset_evaluation() -> None:
+    st.markdown("#### Retrieval evaluation")
+    st.write("Run the evaluation module against your test dataset and download its report.")
+    try:
+        import evaluate_dataset
+    except Exception as exc:
+        st.error(f"Could not import evaluate_dataset.py: {exc}")
+        st.caption("Place evaluate_dataset.py next to app.py and check its dependencies.")
+        return
+
+    mode = st.radio("Mode", ["Single question", "Batch"], horizontal=True)
+    if mode == "Single question":
+        question_id = st.text_input("Question ID", placeholder="LDCOM-005")
+        if st.button("Run evaluation", type="primary"):
+            if not question_id.strip():
+                st.warning("Enter a question ID.")
+                return
+            try:
+                with st.spinner(f"Evaluating {question_id.strip()}..."):
+                    result = evaluate_dataset.answer_single_question(question_id.strip())
+                if result is not None:
+                    st.write(result)
+                else:
+                    st.success("Evaluation finished. Check the module's configured output.")
+            except Exception as exc:
+                st.error(f"Evaluation failed: {exc}")
+    else:
+        limit = st.number_input(
+            "Number of questions (0 runs all)",
+            min_value=0,
+            max_value=10000,
+            value=10,
+            step=1,
+        )
+        if st.button("Run batch", type="primary"):
+            try:
+                with st.spinner("Running evaluation..."):
+                    if limit > 0:
+                        result = evaluate_dataset.answer_dataset(limit=int(limit))
+                    else:
+                        result = evaluate_dataset.answer_dataset()
+                if result is not None:
+                    st.write(result)
+                st.success("Batch evaluation finished.")
+                for attr, label in [
+                    ("OUTPUT_JSON", "Download JSON results"),
+                    ("OUTPUT_REPORT", "Download Markdown report"),
+                ]:
+                    path = getattr(evaluate_dataset, attr, None)
+                    if path and os.path.exists(path):
+                        with open(path, "rb") as handle:
+                            st.download_button(
+                                label,
+                                data=handle.read(),
+                                file_name=os.path.basename(path),
+                            )
+            except Exception as exc:
+                st.error(f"Batch evaluation failed: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    init_state()
+    inject_css()
+
+    llm_model, embeddings_model, custom_prompt, api_key, upload_request = render_sidebar()
+
+    assistant = get_or_create_assistant(
+        llm_model=llm_model,
+        embeddings_model=embeddings_model,
+        custom_prompt=custom_prompt,
+        openrouter_api_key=api_key,
+    )
+
+    if upload_request is not None:
+        index_uploaded_pdf(assistant, upload_request)
+
+    render_header(connected=assistant is not None)
+
+    if st.session_state.get("last_error"):
+        st.error(f"Assistant initialization failed: {st.session_state['last_error']}")
+        st.caption("Check that Ollama, Qdrant and PostgreSQL are running and the selected model is available.")
+
+    tab_chat, tab_architecture, tab_revisions, tab_evaluation = st.tabs(
+        ["Chat", "Architecture", "Revisions", "Evaluation"]
+    )
+
+    with tab_chat:
+        render_chat(assistant)
+
+    with tab_architecture:
+        render_structured_analysis(assistant, llm_model, api_key)
+
+    with tab_revisions:
+        render_revision_comparison()
+
+    with tab_evaluation:
+        render_dataset_evaluation()
+
 
 if __name__ == "__main__":
-    main(enable_debug=False)
+    main()

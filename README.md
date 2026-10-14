@@ -89,6 +89,34 @@ If following error occured in the step 5 or step 6, please try to change the mir
 > docker: error pulling image configuration: download failed after attempts=6: dial tcp 199.16.156.11:443: connect: connection refused.
 
 
+## Instant Start Guide
+
+Follow these steps to get the RAG app up and running quickly (assumes Docker and Ollama are installed):
+
+1. **Start Qdrant** (vector store):
+   ```bash
+   ./cookbook/run_qdrant.sh
+   ```
+
+2. **Start Ollama and pull models** (if not already):
+   ```bash
+   ollama pull llama3
+   ollama pull nomic-embed-text
+   ```
+
+3. **Run the Streamlit app**:
+   ```bash
+   streamlit run app.py
+   ```
+
+4. Open your browser at **http://localhost:8501**.  
+   - Upload your PDFs via the **Upload** tab.  
+   - Ask questions directly.
+
+**Example PDF**: `./cookbook/data/AUTOSAR/AUTOSAR_CP_SWS_DiagnosticCommunicationManager-54-78.pdf`
+
+---
+
 ### 7. Run RAG App
 
 ```shell
