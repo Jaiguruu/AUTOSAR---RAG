@@ -1,29 +1,133 @@
 # TATA Techpulse AUTOSAR Assistant
+
 This is an AUTOSAR document assistant with RAG, structured architecture analysis, and revision comparison.
 
 ## Environmental requirements
 
-- Operation System
-    - Linux/MacOS (recommend)
-    - Windwons
-- Docker
-- Python: 3.9.6 (compatibility issue may occur if version too hign)
+- **Operating System**: Linux/macOS (recommended) or Windows
+- **Docker**: Required for vector stores
+- **Python**: 3.9.6 (compatible; newer versions may work but have not been tested)
 
 ## Installation
 
-### 1. [Install](https://github.com/ollama/ollama?tab=readme-ov-file#macos) ollama and pull models
-
-Pull the `llama3`:
+### 1. Install Ollama and pull models
 
 ```shell
-ollama pull llama3
+# Install Ollama (see https://github.com/ollama/ollama)
+# Then pull the LLM and embedding models
+ollama pull qwen-2.5-coder:1.5b
+ollama pull all-minilm:l6-v2
 ```
 
-Pull the Embeddings model:
+### 2. Create a virtual environment
 
 ```shell
-ollama pull nomic-embed-text
+python3 -m venv ~/.venvs/autosar
+source ~/.venvs/autosar/bin/activate
 ```
+
+### 3. Install Python dependencies
+
+```shell
+pip install -r cookbook/requirements.txt
+```
+
+### 4. Install Docker
+
+> Follow Docker's official installation guide: https://docs.docker.com/get-started/get-docker/
+
+### 5. Run PgVector (PostgreSQL with vector extension)
+
+You can start it with the helper script or directly via Docker:
+
+```shell
+# Using helper script
+./cookbook/run_pgvector.sh
+```
+
+Or manually:
+
+```shell
+docker run -d \
+  -e POSTGRES_DB=ai \
+  -e POSTGRES_USER=ai \
+  -e POSTGRES_PASSWORD=ai \
+  -e PGDATA=/var/lib/postgresql/data/pgdata \
+  -v pgvolume:/var/lib/postgresql/data \
+  -p 5532:5432 \
+  --name pgvector \
+  phidata/pgvector:16
+```
+
+### 6. Run Qdrant (vector store)
+
+```shell
+# Using helper script
+./cookbook/run_qdrant.sh
+```
+
+Or manually:
+
+```shell
+docker run -itd --name=qdrant \
+    -p 6333:6333 \
+    -p 6334:6334 \
+    -e "QDRANT__SERVICE__API_KEY=123456" \
+    -e "QDRANT__SERVICE__JWT_RBAC=true" \
+    -v /home/qdrant_storage:/qdrant/storage:z \
+    qdrant/qdrant
+```
+
+> **Note**: If you encounter Docker image download errors, try switching to a different Docker registry mirror.
+
+## Instant Start Guide
+
+Assuming Docker and Ollama are installed, follow these steps to get the RAG app running quickly:
+
+1. **Start Qdrant** (vector store):
+
+   ```bash
+   ./cookbook/run_qdrant.sh
+   ```
+
+2. **Start Ollama and pull models** (if not already done):
+
+   ```bash
+   ollama pull qwen-2.5-coder:1.5b
+   ollama pull all-minilm:l6-v2
+   ```
+
+3. **Run the Streamlit app**:
+
+   ```bash
+   streamlit run app.py
+   ```
+
+4. Open your browser at **http://localhost:8501**.
+
+   - Upload your AUTOSAR PDFs via the **Upload** tab.
+   - Ask questions directly.
+
+### Example PDF
+
+You can test with the sample PDF provided in the repository:
+
+```
+./cookbook/data/AUTOSAR/AUTOSAR_CP_SWS_DiagnosticCommunicationManager-54-78.pdf
+```
+
+---
+
+## Running the RAG App
+
+```shell
+streamlit run app.py
+```
+
+- Open [http://localhost:8501](http://localhost:8501) to view the app.
+- Add PDFs or ask questions directly.
+- Example PDF path: `./cookbook/data/AUTOSAR/AUTOSAR_CP_SWS_DiagnosticCommunicationManager-54-78.pdf`
+
 
 ### 2. Create a virtual environment
 

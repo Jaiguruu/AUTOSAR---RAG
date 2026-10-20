@@ -38,6 +38,7 @@ ASSETS_DIR = BASE_DIR / "assets"
 PUML_TEMPLATE_PATH = ASSETS_DIR / "autosar_basic.puml"
 LOGO_PATH = ASSETS_DIR / "robot_autosar.jpeg"
 PROCESSED_UPLOADS_KEY = "processed_upload_hashes"
+ARCH_RESULT_KEY = "architecture_result"
 
 SUGGESTED_QUESTIONS = [
     "Summarize the responsibilities of the LdCom module.",
@@ -47,15 +48,6 @@ SUGGESTED_QUESTIONS = [
 
 # ---------------------------------------------------------------------------
 # Styling
-#
-# Palette
-#   paper    #EDEFF1  app background (cool grey, like drafting stock)
-#   surface  #F8F9FA  inputs, panels
-#   ink      #1D262D  text
-#   petrol   #0F5C7A  the single accent
-#   amber    #A86A12  warnings      red #B3261E  errors      green #2E7D4F  ok
-# Type: IBM Plex Sans for UI, IBM Plex Mono only for identifiers and code.
-# Shape: 3px radius everywhere, 1px rules for structure, no shadows.
 # ---------------------------------------------------------------------------
 
 CSS = """
@@ -168,7 +160,7 @@ footer, .stDeployButton { display: none !important; }
 .stButton > button:focus-visible, .stDownloadButton > button:focus-visible {
   outline: 2px solid var(--accent); outline-offset: 2px;
 }
-.suggest .stButton > button { text-align: left; justify-content: flex-start; height: 100%; font-weight: 400; }
+.st-key-suggest .stButton > button { text-align: left; justify-content: flex-start; height: 100%; font-weight: 400; }
 
 /* Inputs */
 [data-baseweb="select"] > div, [data-baseweb="input"] > div, [data-baseweb="textarea"],
@@ -215,12 +207,16 @@ def inject_css() -> None:
     st.markdown(CSS, unsafe_allow_html=True)
 
 
+DEFAULT_AUTOSAR_PUML = """@startuml\nskinparam rectangle {\n    BackgroundColor LightYellow\n    BorderColor Black\n}\n\ntitle AUTOSAR Basic Architecture\n\npackage \"Application Layer\" {\n    [Software Component (SWC)] as SWC <<App>>\n}\n\npackage \"Runtime Environment\" {\n    [RTE] as RTE <<RTE>>\n}\n\npackage \"Basic Software (BSW)\" {\n    [Services] as BSW_Serv <<BSW>>\n    [ECU Abstraction] as BSW_ECU <<BSW>>\n    [MCAL] as BSW_MCAL <<BSW>>\n}\n\npackage \"Microcontroller & HW\" {\n    [HW] as HW <<HW>>\n}\n\nSWC --> RTE : Ports\nRTE --> BSW_Serv : Calls\nBSW_Serv --> BSW_ECU : Uses\nBSW_ECU --> BSW_MCAL : Driver calls\nBSW_MCAL --> HW : Register access\n@enduml"""
+
+
 def read_puml_template() -> str:
-    """Load the optional PlantUML template without crashing the app."""
+    """Return the PlantUML reference template, falling back to the built-in one."""
     try:
-        return PUML_TEMPLATE_PATH.read_text(encoding="utf-8")
+        text = PUML_TEMPLATE_PATH.read_text(encoding="utf-8").strip()
+        return text or DEFAULT_AUTOSAR_PUML
     except OSError:
-        return ""
+        return DEFAULT_AUTOSAR_PUML
 
 
 AUTOSAR_BASIC_PUML = read_puml_template()
@@ -243,13 +239,14 @@ def init_state() -> None:
                 ),
             }
         ],
-        "processed_upload_hashes": set(),
+        PROCESSED_UPLOADS_KEY: set(),
         "indexed_files": [],
         "pending_prompt": None,
         "custom_prompt": "",
         "llm_model": None,
         "embeddings_model": None,
         "last_error": None,
+        ARCH_RESULT_KEY: None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -433,10 +430,17 @@ def render_sidebar():
                 assistant = st.session_state.get("rag_assistant")
                 try:
                     if assistant and assistant.knowledge_base and assistant.knowledge_base.vector_db:
-                        assistant.knowledge_base.vector_db.drop()
+                        vector_db = assistant.knowledge_base.vector_db
+                        vector_db.drop()
+                        # Recreate the empty collection so later indexing/search still works.
+                        try:
+                            vector_db.create()
+                        except Exception:
+                            logger.exception("Could not recreate the collection after drop")
                         st.success("Knowledge collection cleared.")
                         st.session_state[PROCESSED_UPLOADS_KEY] = set()
                         st.session_state["indexed_files"] = []
+                        st.session_state[ARCH_RESULT_KEY] = None
                     else:
                         st.info("Assistant or vector database is not initialized.")
                 except Exception as exc:
@@ -538,7 +542,6 @@ def index_uploaded_pdf(assistant, uploaded_file) -> None:
             st.session_state[PROCESSED_UPLOADS_KEY].add(file_hash)
             st.session_state["indexed_files"].append((uploaded_file.name, len(phi_documents)))
             status.update(label=f"Indexed {uploaded_file.name}", state="complete")
-        st.rerun()
     except Exception as exc:
         logger.exception("PDF indexing failed")
         st.error(f"Indexing failed: {exc}")
@@ -546,18 +549,25 @@ def index_uploaded_pdf(assistant, uploaded_file) -> None:
             "For rate-limit errors, wait for the provider quota to reset. "
             "For vector dimension errors, use a collection that matches the selected embedder."
         )
+        return
+
+    # Rerun only after success, outside the try block, so the sidebar list refreshes.
+    st.rerun()
 
 
 # ---------------------------------------------------------------------------
 # Chat
 # ---------------------------------------------------------------------------
 
+DIAGRAM_FLAG = re.compile(r"(?<!\S)/bd\b")
+
+
 def build_query(prompt: str) -> tuple[str, bool]:
-    is_diagram_request = "/bd" in prompt
+    is_diagram_request = bool(DIAGRAM_FLAG.search(prompt))
     if not is_diagram_request:
         return prompt, False
 
-    query = prompt.replace("/bd", "").strip()
+    query = DIAGRAM_FLAG.sub("", prompt).strip()
     if AUTOSAR_BASIC_PUML:
         query += (
             "\nGenerate a PlantUML block diagram. Return the code between "
@@ -588,11 +598,17 @@ def render_chat(assistant) -> None:
             "Add <code>/bd</code> to a question to get a block diagram.</div>",
             unsafe_allow_html=True,
         )
-        st.markdown("<div class='suggest'>", unsafe_allow_html=True)
-        cols = st.columns(len(SUGGESTED_QUESTIONS))
-        for idx, (col, text) in enumerate(zip(cols, SUGGESTED_QUESTIONS)):
-            col.button(text, key=f"suggest_{idx}", on_click=queue_prompt, args=(text,), use_container_width=True)
-        st.markdown("</div>", unsafe_allow_html=True)
+        # A keyed container gets the CSS class "st-key-suggest" (Streamlit >= 1.39).
+        with st.container(key="suggest"):
+            cols = st.columns(len(SUGGESTED_QUESTIONS))
+            for idx, (col, text) in enumerate(zip(cols, SUGGESTED_QUESTIONS)):
+                col.button(
+                    text,
+                    key=f"suggest_{idx}",
+                    on_click=queue_prompt,
+                    args=(text,),
+                    use_container_width=True,
+                )
 
     typed = st.chat_input("Ask about your AUTOSAR documents")
     prompt = typed or pending
@@ -667,96 +683,183 @@ def render_diagram(full_response: str) -> None:
 # Architecture analysis
 # ---------------------------------------------------------------------------
 
+def _puml_alias(text: str, used: set[str], prefix: str = "n") -> str:
+    """Make a unique PlantUML-safe identifier from arbitrary text."""
+    base = re.sub(r"\W+", "_", str(text)).strip("_") or prefix
+    if base[0].isdigit():
+        base = f"{prefix}_{base}"
+    alias, n = base, 2
+    while alias in used:
+        alias = f"{base}_{n}"
+        n += 1
+    used.add(alias)
+    return alias
+
+
+def _puml_label(text: str) -> str:
+    return str(text).replace('"', "'").replace("\n", " ")
+
+
+def build_component_puml(components: list[dict]) -> str:
+    lines = [
+        "@startuml",
+        "skinparam component {",
+        "    BackgroundColor LightYellow",
+        "    BorderColor Black",
+        "}",
+        "title Extracted component architecture",
+    ]
+    used: set[str] = set()
+    for comp in components:
+        comp_name = comp.get("name", "Component")
+        comp_alias = _puml_alias(comp_name, used, "comp")
+        lines.append(f'component "{_puml_label(comp_name)}" as {comp_alias}')
+        for port in comp.get("ports", []) or []:
+            if isinstance(port, dict):
+                port_name = port.get("name", "port")
+                port_type = port.get("type", "")
+            else:
+                port_name, port_type = str(port), ""
+            port_alias = _puml_alias(f"{comp_alias}_{port_name}", used, "port")
+            lines.append(f'() "{_puml_label(port_name)}" as {port_alias}')
+            suffix = f" : {_puml_label(port_type)}" if port_type else ""
+            lines.append(f"{comp_alias} -- {port_alias}{suffix}")
+    lines.append("@enduml")
+    return "\n".join(lines)
+
+
+def render_component_diagram(components: list[dict]) -> None:
+    puml_code = build_component_puml(components)
+    puml_path = BASE_DIR / "generated_component_diagram.puml"
+    image_path = BASE_DIR / "component_diagram.png"
+    puml_path.write_text(puml_code, encoding="utf-8")
+    try:
+        generate_plantuml_image(str(puml_path), str(image_path))
+        if image_path.exists():
+            st.image(str(image_path), caption="Component diagram", use_container_width=True)
+            st.download_button(
+                "Download PlantUML",
+                data=puml_code,
+                file_name="generated_component_diagram.puml",
+                mime="text/plain",
+                key="dl_component_puml",
+            )
+    except Exception as exc:
+        st.warning(f"Diagram rendering failed: {exc}")
+        st.code(puml_code, language="text")
+
+
+def run_extraction(assistant, llm_model: str, api_key: Optional[str]) -> Optional[dict]:
+    """Retrieve evidence, extract a model and validate it. Returns None if nothing to show."""
+    docs = assistant.knowledge_base.search(
+        "AUTOSAR component architecture ports interfaces dependencies"
+    )
+    docs = docs[:10] if docs else []
+    if not docs:
+        st.warning("No matching chunks found. Index an architecture document first.")
+        return None
+
+    extractor = StructuredExtractor(llm_model=llm_model, openrouter_api_key=api_key)
+    extractions = []
+    for doc in docs:
+        text = getattr(doc, "content", "") or ""
+        if not text.strip():
+            continue
+        try:
+            extractions.append(extractor.extract_from_text(text))
+        except Exception:
+            # One bad chunk should not abort the whole run.
+            logger.exception("Extraction failed for one chunk")
+    if not extractions:
+        st.warning("The model could not extract anything from the retrieved chunks.")
+        return None
+
+    model = extractor.merge_extractions(extractions)
+    findings = ConsistencyValidator().validate_model(model)
+    return {"model": model, "findings": findings or []}
+
+
 def render_structured_analysis(assistant, llm_model: str, api_key: Optional[str]) -> None:
     st.markdown("#### Architecture extraction")
     st.write(
         "Pulls architecture-related chunks from the index, extracts a component "
         "inventory with an LLM, then runs consistency checks on the result."
     )
-    if not st.button("Run extraction", type="primary"):
+
+    if st.button("Run extraction", type="primary"):
+        if assistant is None or not getattr(assistant, "knowledge_base", None):
+            st.warning("Initialize the assistant and index a PDF first.")
+        else:
+            try:
+                with st.spinner("Retrieving evidence and extracting components..."):
+                    st.session_state[ARCH_RESULT_KEY] = run_extraction(assistant, llm_model, api_key)
+            except Exception as exc:
+                logger.exception("Structured analysis failed")
+                st.error(f"Structured analysis failed: {exc}")
+
+    # Results live in session_state so they survive the reruns caused by
+    # the download and diagram buttons below.
+    result = st.session_state.get(ARCH_RESULT_KEY)
+    if not result:
         return
 
-    if assistant is None or not assistant.knowledge_base:
-        st.warning("Initialize the assistant and index a PDF first.")
-        return
-    try:
-        with st.spinner("Retrieving evidence and extracting components..."):
-            docs = assistant.knowledge_base.search(
-                "AUTOSAR component architecture ports interfaces dependencies"
-            )
-            docs = docs[:10] if docs else []
-            if not docs:
-                st.warning("No matching chunks found. Index an architecture document first.")
-                return
+    model = result["model"]
+    findings = result["findings"]
+    components = model.get("components", []) or []
+    total_ports = sum(len(item.get("ports", []) or []) for item in components)
 
-            extractor = StructuredExtractor(
-                llm_model=llm_model,
-                openrouter_api_key=api_key,
-            )
-            extractions = [
-                extractor.extract_from_text(doc.content)
-                for doc in docs
-                if getattr(doc, "content", "").strip()
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Components", len(components))
+    m2.metric("Ports", total_ports)
+    m3.metric("Findings", len(findings))
+
+    if components:
+        df = pd.DataFrame(
+            [
+                {
+                    "Component": item.get("name", "Unknown"),
+                    "Type": item.get("type", "N/A"),
+                    "Ports": len(item.get("ports", []) or []),
+                }
+                for item in components
             ]
-            model = extractor.merge_extractions(extractions)
-            findings = ConsistencyValidator().validate_model(model)
+        )
+        st.markdown("#### Component inventory")
+        st.dataframe(df, use_container_width=True, hide_index=True)
+        left, right = st.columns(2)
+        left.download_button(
+            "Download JSON",
+            data=json.dumps(model, indent=2, ensure_ascii=False),
+            file_name="architecture_inventory.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+        right.download_button(
+            "Download CSV",
+            data=df.to_csv(index=False),
+            file_name="components_inventory.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+        if st.button("Generate component diagram", key="gen_component_diagram"):
+            render_component_diagram(components)
+    else:
+        st.info("No components were extracted from the retrieved evidence.")
 
-        components = model.get("components", [])
-        total_ports = sum(len(item.get("ports", [])) for item in components)
-
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Components", len(components))
-        m2.metric("Ports", total_ports)
-        m3.metric("Findings", len(findings or []))
-
-        if components:
-            df = pd.DataFrame(
-                [
-                    {
-                        "Component": item.get("name", "Unknown"),
-                        "Type": item.get("type", "N/A"),
-                        "Ports": len(item.get("ports", [])),
-                    }
-                    for item in components
-                ]
+    st.markdown("#### Consistency report")
+    if findings:
+        for finding in findings:
+            severity = str(finding.get("severity", "Warning")).lower()
+            message = (
+                f"**{finding.get('component', 'Unknown component')}**: "
+                f"{finding.get('issue', 'Unspecified finding')}"
             )
-            st.markdown("#### Component inventory")
-            st.dataframe(df, use_container_width=True, hide_index=True)
-            left, right = st.columns(2)
-            left.download_button(
-                "Download JSON",
-                data=json.dumps(model, indent=2, ensure_ascii=False),
-                file_name="architecture_inventory.json",
-                mime="application/json",
-                use_container_width=True,
-            )
-            right.download_button(
-                "Download CSV",
-                data=df.to_csv(index=False),
-                file_name="components_inventory.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-        else:
-            st.info("No components were extracted from the retrieved evidence.")
-
-        st.markdown("#### Consistency report")
-        if findings:
-            for finding in findings:
-                severity = str(finding.get("severity", "Warning")).lower()
-                message = (
-                    f"**{finding.get('component', 'Unknown component')}**: "
-                    f"{finding.get('issue', 'Unspecified finding')}"
-                )
-                if severity == "error":
-                    st.error(message)
-                else:
-                    st.warning(message)
-        else:
-            st.success("The validator found no inconsistencies.")
-    except Exception as exc:
-        logger.exception("Structured analysis failed")
-        st.error(f"Structured analysis failed: {exc}")
+            if severity == "error":
+                st.error(message)
+            else:
+                st.warning(message)
+    else:
+        st.success("The validator found no inconsistencies.")
 
 
 # ---------------------------------------------------------------------------
@@ -794,11 +897,11 @@ def render_revision_comparison() -> None:
         m.metric("Modified", len(modified))
 
         if added:
-            st.success("Added: " + ", ".join(added))
+            st.success("Added: " + ", ".join(map(str, added)))
         if removed:
-            st.error("Removed: " + ", ".join(removed))
+            st.error("Removed: " + ", ".join(map(str, removed)))
         if modified:
-            st.warning("Modified: " + ", ".join(modified))
+            st.warning("Modified: " + ", ".join(map(str, modified)))
         if not any((added, removed, modified)):
             st.info("No component-level changes were detected.")
     except Exception as exc:
@@ -864,6 +967,7 @@ def render_dataset_evaluation() -> None:
                                 label,
                                 data=handle.read(),
                                 file_name=os.path.basename(path),
+                                key=f"dl_{attr}",
                             )
             except Exception as exc:
                 st.error(f"Batch evaluation failed: {exc}")
