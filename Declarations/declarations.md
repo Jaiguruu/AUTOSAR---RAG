@@ -7,9 +7,9 @@ I hereby declare that the capstone project entitled **"AUTOSAR HLD Document Anal
 - Due citations, references, and credits have been provided wherever existing open-source libraries, models, frameworks, or AUTOSAR specifications are utilized.
 - This submission complies with all ethical standards and institutional guidelines.
 
-**Student Name:** [Student Name]  
-**Register Number:** [Register No]  
+**Student Name:** Pranav Jai S S  
+**Register Number:** 127003193  
 **Department / Branch:** CS / AIML  
-**University / Institution:** [University Name]  
-**Date:** [Date]  
-**Signature:** __________________________
+**University / Institution:** TATA Techpulse / University  
+**Date:** October 20, 2026  
+**Signature:** Pranav Jai S S
